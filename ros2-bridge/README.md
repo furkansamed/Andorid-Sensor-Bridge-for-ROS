@@ -6,11 +6,17 @@ This package listens for the Android streamer protocol and republishes it as ROS
 
 - `/camera/image_raw` as `sensor_msgs/msg/Image`
 - `/camera/camera_info` as `sensor_msgs/msg/CameraInfo` when `publish_camera_info:=true`
-- `/imu/data_raw` as `sensor_msgs/msg/Imu`
+- `/imu/data_raw` as `sensor_msgs/msg/Imu` from the raw UDP IMU stream
+- `/imu/image_sync` as `sensor_msgs/msg/Imu` from the IMU sample embedded in each video packet header
 
 ## Timestamp handling
 
-The phone sends camera and IMU timestamps from `elapsedRealtimeNanos`. The bridge keeps those timestamps synchronized by mapping the phone monotonic clock onto the current ROS clock using a single offset estimated from the first packet it receives.
+The phone now sends both camera frames and IMU in the same `elapsedRealtimeNanos` domain:
+
+- Raw IMU over UDP includes accel, gyro, quaternion, and Euler angles.
+- Each TCP video packet includes the encoded H.264 payload plus a frame-synced IMU snapshot with the same timestamp domain.
+
+The bridge maps the phone clock onto the current ROS clock using a single offset estimated from the first packet it receives. Because the frame-synced IMU sample rides inside the video header, `/camera/image_raw` and `/imu/image_sync` stay aligned at the packet level.
 
 ## Ubuntu setup
 
@@ -55,5 +61,7 @@ Typical fields to replace after calibration:
 ```bash
 ros2 topic hz /camera/image_raw
 ros2 topic hz /imu/data_raw
+ros2 topic hz /imu/image_sync
 ros2 topic echo /imu/data_raw --once
+ros2 topic echo /imu/image_sync --once
 ```

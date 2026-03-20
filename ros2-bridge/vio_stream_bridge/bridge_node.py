@@ -15,19 +15,9 @@ from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, Image, Imu
 
 
-VIDEO_HEADER_STRUCT = struct.Struct(">qI")
-IMU_STRUCT = struct.Struct(">qffffff")
+VIDEO_HEADER_STRUCT = struct.Struct(">qqfffffffffffffI")
+IMU_STRUCT = struct.Struct(">qfffffffffffff")
 MAX_VIDEO_PAYLOAD_BYTES = 2 * 1024 * 1024
-
-
-@dataclass
-class DecodedFrame:
-    timestamp_ns: int
-    width: int
-    height: int
-    encoding: str
-    step: int
-    data: bytes
 
 
 @dataclass
@@ -39,6 +29,31 @@ class ImuSample:
     gx: float
     gy: float
     gz: float
+    qx: float
+    qy: float
+    qz: float
+    qw: float
+    pitch_rad: float
+    yaw_rad: float
+    roll_rad: float
+
+
+@dataclass
+class VideoPacketHeader:
+    frame_timestamp_ns: int
+    synced_sample: ImuSample
+    payload_size: int
+
+
+@dataclass
+class DecodedFrame:
+    timestamp_ns: int
+    width: int
+    height: int
+    encoding: str
+    step: int
+    data: bytes
+    synced_imu: ImuSample | None
 
 
 class ClockMapper:
@@ -82,6 +97,7 @@ class VioStreamBridge(Node):
         self.image_publisher = self.create_publisher(Image, "camera/image_raw", qos)
         self.camera_info_publisher = self.create_publisher(CameraInfo, "camera/camera_info", qos)
         self.imu_publisher = self.create_publisher(Imu, "imu/data_raw", qos)
+        self.synced_imu_publisher = self.create_publisher(Imu, "imu/image_sync", qos)
 
         self.video_queue: queue.Queue[DecodedFrame] = queue.Queue(maxsize=4)
         self.imu_queue: queue.Queue[ImuSample] = queue.Queue(maxsize=1024)
@@ -112,7 +128,10 @@ class VioStreamBridge(Node):
         self.declare_parameter("image_width", 640)
         self.declare_parameter("image_height", 480)
         self.declare_parameter("distortion_model", "plumb_bob")
-        self.declare_parameter("distortion_coefficients", [0.0, 0.0, 0.0, 0.0, 0.0])
+        self.declare_parameter(
+            "distortion_coefficients",
+            [0.0, 0.0, 0.0, 0.0, 0.0],
+        )
         self.declare_parameter(
             "camera_matrix",
             [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
@@ -127,7 +146,7 @@ class VioStreamBridge(Node):
         )
         self.declare_parameter(
             "orientation_covariance",
-            [-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         )
         self.declare_parameter(
             "angular_velocity_covariance",
@@ -178,38 +197,41 @@ class VioStreamBridge(Node):
 
             self.get_logger().info(f"Video client connected from {address[0]}:{address[1]}")
             decoder = av.CodecContext.create("h264", "r")
-            last_timestamp_ns = 0
+            last_header: VideoPacketHeader | None = None
             try:
                 with client:
                     client.settimeout(1.0)
                     while not self.stop_event.is_set():
-                        header = self._recv_exact(client, VIDEO_HEADER_STRUCT.size)
-                        if header is None:
+                        raw_header = self._recv_exact(client, VIDEO_HEADER_STRUCT.size)
+                        if raw_header is None:
                             break
-                        timestamp_ns, payload_size = VIDEO_HEADER_STRUCT.unpack(header)
-                        if payload_size <= 0 or payload_size > MAX_VIDEO_PAYLOAD_BYTES:
+                        header = self._parse_video_header(raw_header)
+                        if header.payload_size <= 0 or header.payload_size > MAX_VIDEO_PAYLOAD_BYTES:
                             self.get_logger().warning(
-                                f"Ignoring suspicious video payload size {payload_size}"
+                                f"Ignoring suspicious video payload size {header.payload_size}"
                             )
                             break
-                        payload = self._recv_exact(client, payload_size)
+                        payload = self._recv_exact(client, header.payload_size)
                         if payload is None:
                             break
-                        if timestamp_ns > 0:
-                            last_timestamp_ns = timestamp_ns
+                        if header.frame_timestamp_ns > 0:
+                            last_header = header
                         for packet in decoder.parse(payload):
                             for frame in decoder.decode(packet):
-                                frame_timestamp_ns = last_timestamp_ns or timestamp_ns
+                                effective_header = last_header or header
                                 pixel_data = frame.to_ndarray(format="bgr24").tobytes()
                                 self._put_latest(
                                     self.video_queue,
                                     DecodedFrame(
-                                        timestamp_ns=frame_timestamp_ns,
+                                        timestamp_ns=effective_header.frame_timestamp_ns,
                                         width=frame.width,
                                         height=frame.height,
                                         encoding="bgr8",
                                         step=frame.width * 3,
                                         data=pixel_data,
+                                        synced_imu=self._valid_synced_sample(
+                                            effective_header.synced_sample
+                                        ),
                                     ),
                                 )
             except OSError as error:
@@ -247,8 +269,7 @@ class VioStreamBridge(Node):
                 self.get_logger().info(f"IMU packets arriving from {address[0]}:{address[1]}")
                 logged_first_sender = True
 
-            unpacked = IMU_STRUCT.unpack(payload)
-            self._put_latest(self.imu_queue, ImuSample(*unpacked))
+            self._put_latest(self.imu_queue, ImuSample(*IMU_STRUCT.unpack(payload)))
 
     def _publish_pending_messages(self) -> None:
         while True:
@@ -256,7 +277,7 @@ class VioStreamBridge(Node):
                 sample = self.imu_queue.get_nowait()
             except queue.Empty:
                 break
-            self._publish_imu(sample)
+            self._publish_imu(sample, self.imu_publisher)
 
         while True:
             try:
@@ -286,11 +307,23 @@ class VioStreamBridge(Node):
             camera_info.height = frame.height
             self.camera_info_publisher.publish(camera_info)
 
-    def _publish_imu(self, sample: ImuSample) -> None:
-        stamp = self.clock_mapper.to_ros_time(sample.timestamp_ns).to_msg()
+        if frame.synced_imu is not None:
+            self._publish_imu(frame.synced_imu, self.synced_imu_publisher, stamp_override=stamp)
+
+    def _publish_imu(
+        self,
+        sample: ImuSample,
+        publisher,
+        stamp_override=None,
+    ) -> None:
+        stamp = stamp_override or self.clock_mapper.to_ros_time(sample.timestamp_ns).to_msg()
         imu_message = Imu()
         imu_message.header.stamp = stamp
         imu_message.header.frame_id = self.imu_frame_id
+        imu_message.orientation.x = sample.qx
+        imu_message.orientation.y = sample.qy
+        imu_message.orientation.z = sample.qz
+        imu_message.orientation.w = sample.qw
         imu_message.linear_acceleration.x = sample.ax
         imu_message.linear_acceleration.y = sample.ay
         imu_message.linear_acceleration.z = sample.az
@@ -300,7 +333,36 @@ class VioStreamBridge(Node):
         imu_message.orientation_covariance = self.orientation_covariance
         imu_message.angular_velocity_covariance = self.angular_velocity_covariance
         imu_message.linear_acceleration_covariance = self.linear_acceleration_covariance
-        self.imu_publisher.publish(imu_message)
+        publisher.publish(imu_message)
+
+    def _parse_video_header(self, payload: bytes) -> VideoPacketHeader:
+        unpacked = VIDEO_HEADER_STRUCT.unpack(payload)
+        synced_sample = ImuSample(
+            timestamp_ns=unpacked[1],
+            ax=unpacked[2],
+            ay=unpacked[3],
+            az=unpacked[4],
+            gx=unpacked[5],
+            gy=unpacked[6],
+            gz=unpacked[7],
+            qx=unpacked[8],
+            qy=unpacked[9],
+            qz=unpacked[10],
+            qw=unpacked[11],
+            pitch_rad=unpacked[12],
+            yaw_rad=unpacked[13],
+            roll_rad=unpacked[14],
+        )
+        return VideoPacketHeader(
+            frame_timestamp_ns=unpacked[0],
+            synced_sample=synced_sample,
+            payload_size=unpacked[15],
+        )
+
+    def _valid_synced_sample(self, sample: ImuSample) -> ImuSample | None:
+        if sample.timestamp_ns <= 0:
+            return None
+        return sample
 
     def _recv_exact(self, client: socket.socket, size: int) -> bytes | None:
         received = bytearray()

@@ -139,18 +139,35 @@ class MainActivity : Activity(), NetworkSender.Listener {
         imuCollector = collector
         cameraStreamer = null
 
+        try {
+            collector.start()
+        } catch (error: Exception) {
+            networkSender = null
+            imuCollector = null
+            resetStats()
+            val message = "IMU start failed: ${error.message ?: "unknown error"}"
+            transitionTo(StreamState.ERROR, message)
+            showToast(message)
+            return
+        }
+
         controlExecutor.execute {
             try {
                 sender.start()
+                if (!collector.awaitWarmup(IMU_WARMUP_TIMEOUT_MS)) {
+                    throw IllegalStateException("IMU warmup timed out")
+                }
                 runOnUiThread {
                     if (networkSender !== sender || streamState != StreamState.CONNECTING) {
+                        collector.stop()
                         sender.stop()
                         return@runOnUiThread
                     }
-                    transitionTo(StreamState.STARTING_CAMERA, "TCP/UDP connected")
+                    transitionTo(StreamState.STARTING_CAMERA, "TCP/UDP connected, IMU synced")
                     startCamera(sender, collector, host)
                 }
             } catch (error: Exception) {
+                collector.stop()
                 sender.stop()
                 runOnUiThread {
                     if (networkSender === sender) {
@@ -178,12 +195,7 @@ class MainActivity : Activity(), NetworkSender.Listener {
                     if (cameraStreamer !== streamer || networkSender !== sender) {
                         return@runOnUiThread
                     }
-                    try {
-                        collector.start()
-                        transitionTo(StreamState.STREAMING, "Streaming to $host")
-                    } catch (error: Exception) {
-                        stopStreaming("IMU start failed: ${error.message ?: "unknown error"}")
-                    }
+                    transitionTo(StreamState.STREAMING, "Streaming to $host")
                 }
             }
 
@@ -200,6 +212,7 @@ class MainActivity : Activity(), NetworkSender.Listener {
             activity = this,
             textureView = binding.previewTexture,
             networkSender = sender,
+            imuCollector = collector,
             listener = cameraListener
         )
 
@@ -342,6 +355,7 @@ class MainActivity : Activity(), NetworkSender.Listener {
         const val PREVIEW_ASPECT_WIDTH = 4
         const val PREVIEW_ASPECT_HEIGHT = 3
         const val STATUS_UPDATE_INTERVAL_MS = 1_000L
+        const val IMU_WARMUP_TIMEOUT_MS = 1_000L
         val IPV4_PATTERN: Pattern = Pattern.compile(
             "^(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)(\\.(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)){3}$"
         )

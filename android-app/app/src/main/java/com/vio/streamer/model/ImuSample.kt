@@ -7,5 +7,12 @@ data class ImuSample(
     val az: Float,
     val gx: Float,
     val gy: Float,
-    val gz: Float
+    val gz: Float,
+    val qx: Float,
+    val qy: Float,
+    val qz: Float,
+    val qw: Float,
+    val pitchRad: Float,
+    val yawRad: Float,
+    val rollRad: Float
 )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import queue
 import socket
 import struct
@@ -23,9 +24,10 @@ except ImportError as error:
 
 VIDEO_PORT = 5000
 IMU_PORT = 5001
-VIDEO_HEADER_STRUCT = struct.Struct(">qI")
-IMU_STRUCT = struct.Struct(">qffffff")
+VIDEO_HEADER_STRUCT = struct.Struct(">qqfffffffffffffI")
+IMU_STRUCT = struct.Struct(">qfffffffffffff")
 BLACK_FRAME_RGB = bytes([12, 16, 20]) * 640 * 480
+RAD_TO_DEG = 180.0 / math.pi
 
 
 @dataclass
@@ -37,14 +39,28 @@ class ImuSample:
     gx: float
     gy: float
     gz: float
+    qx: float
+    qy: float
+    qz: float
+    qw: float
+    pitch_rad: float
+    yaw_rad: float
+    roll_rad: float
+
+
+@dataclass
+class VideoPacketHeader:
+    frame_timestamp_ns: int
+    synced_sample: ImuSample
+    payload_size: int
 
 
 class ReceiverApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("VIO Stream Receiver")
-        self.root.geometry("1080x760")
-        self.root.minsize(960, 700)
+        self.root.geometry("1160x820")
+        self.root.minsize(980, 720)
         self.log_file_path = Path(__file__).with_name("receiver.log")
 
         self.stop_event = threading.Event()
@@ -66,8 +82,13 @@ class ReceiverApp:
         self.video_fps = 0.0
         self.imu_hz = 0.0
         self.video_last_ts = 0
+        self.synced_imu_last_ts = 0
         self.imu_last_ts = 0
+        self.last_synced_sample: ImuSample | None = None
         self.last_imu_sample: ImuSample | None = None
+        self.first_video_ts: int | None = None
+        self.first_sync_ts: int | None = None
+        self.first_imu_ts: int | None = None
         self.logged_first_frame = False
         self.logged_first_imu = False
         self.last_video_packet_count = 0
@@ -78,9 +99,30 @@ class ReceiverApp:
         self.video_status_var = tk.StringVar(value="Video: waiting")
         self.imu_status_var = tk.StringVar(value="IMU: waiting")
         self.local_ips_var = tk.StringVar(value=", ".join(self.discover_ipv4_addresses()))
-        self.video_stats_var = tk.StringVar(value="Video packets: 0\nVideo FPS: 0.0\nTimestamp: -")
+        self.video_stats_var = tk.StringVar(
+            value=(
+                "Video packets: 0\n"
+                "Video FPS: 0.0\n"
+                "Frame timestamp: -\n"
+                "Frame T+: -\n"
+                "Synced IMU timestamp: -\n"
+                "Sync delta: -\n"
+                "Frame accel: -\n"
+                "Frame gyro: -\n"
+                "Frame Euler(deg): -"
+            )
+        )
         self.imu_stats_var = tk.StringVar(
-            value="IMU packets: 0\nIMU Hz: 0.0\nTimestamp: -\nAccel: -\nGyro: -"
+            value=(
+                "IMU packets: 0\n"
+                "IMU Hz: 0.0\n"
+                "Timestamp: -\n"
+                "IMU T+: -\n"
+                "Accel: -\n"
+                "Gyro: -\n"
+                "Quat: -\n"
+                "Euler(deg): -"
+            )
         )
 
         self._build_ui()
@@ -128,7 +170,7 @@ class ReceiverApp:
         )
         self.video_label.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Label(stats_panel, text="Video").pack(anchor=tk.W)
+        ttk.Label(stats_panel, text="Video / Frame-Synced IMU").pack(anchor=tk.W)
         ttk.Label(
             stats_panel,
             textvariable=self.video_stats_var,
@@ -136,7 +178,7 @@ class ReceiverApp:
             font=("Consolas", 11)
         ).pack(anchor=tk.W, fill=tk.X, pady=(4, 12))
 
-        ttk.Label(stats_panel, text="IMU").pack(anchor=tk.W)
+        ttk.Label(stats_panel, text="Raw IMU (UDP)").pack(anchor=tk.W)
         ttk.Label(
             stats_panel,
             textvariable=self.imu_stats_var,
@@ -163,8 +205,13 @@ class ReceiverApp:
         self.video_fps = 0.0
         self.imu_hz = 0.0
         self.video_last_ts = 0
+        self.synced_imu_last_ts = 0
         self.imu_last_ts = 0
+        self.last_synced_sample = None
         self.last_imu_sample = None
+        self.first_video_ts = None
+        self.first_sync_ts = None
+        self.first_imu_ts = None
         self.logged_first_frame = False
         self.logged_first_imu = False
         self.last_video_packet_count = 0
@@ -246,16 +293,22 @@ class ReceiverApp:
             try:
                 with client:
                     while not self.stop_event.is_set():
-                        header = self.recv_exact(client, VIDEO_HEADER_STRUCT.size)
-                        if not header:
+                        raw_header = self.recv_exact(client, VIDEO_HEADER_STRUCT.size)
+                        if not raw_header:
                             break
-                        timestamp_ns, payload_size = VIDEO_HEADER_STRUCT.unpack(header)
-                        payload = self.recv_exact(client, payload_size)
+                        header = self.parse_video_header(raw_header)
+                        payload = self.recv_exact(client, header.payload_size)
                         if payload is None:
                             break
                         self.video_packets += 1
-                        self.video_last_ts = timestamp_ns
-                        self.decode_video_payload(payload)
+                        self.video_last_ts = header.frame_timestamp_ns
+                        self.synced_imu_last_ts = header.synced_sample.timestamp_ns
+                        self.last_synced_sample = header.synced_sample
+                        if self.first_video_ts is None and header.frame_timestamp_ns > 0:
+                            self.first_video_ts = header.frame_timestamp_ns
+                        if self.first_sync_ts is None and header.synced_sample.timestamp_ns > 0:
+                            self.first_sync_ts = header.synced_sample.timestamp_ns
+                        self.decode_video_payload(payload, header)
             except OSError as error:
                 self.log(f"Video socket closed: {error}")
 
@@ -280,11 +333,12 @@ class ReceiverApp:
                 self.log(f"Ignored IMU packet with size {len(payload)}")
                 continue
 
-            unpacked = IMU_STRUCT.unpack(payload)
-            sample = ImuSample(*unpacked)
+            sample = ImuSample(*IMU_STRUCT.unpack(payload))
             self.last_imu_sample = sample
             self.imu_packets += 1
             self.imu_last_ts = sample.timestamp_ns
+            if self.first_imu_ts is None and sample.timestamp_ns > 0:
+                self.first_imu_ts = sample.timestamp_ns
             if not self.imu_connected:
                 self.imu_connected = True
                 self.imu_peer = address[0]
@@ -306,7 +360,31 @@ class ReceiverApp:
             chunks.extend(chunk)
         return bytes(chunks)
 
-    def decode_video_payload(self, payload: bytes) -> None:
+    def parse_video_header(self, payload: bytes) -> VideoPacketHeader:
+        unpacked = VIDEO_HEADER_STRUCT.unpack(payload)
+        synced_sample = ImuSample(
+            timestamp_ns=unpacked[1],
+            ax=unpacked[2],
+            ay=unpacked[3],
+            az=unpacked[4],
+            gx=unpacked[5],
+            gy=unpacked[6],
+            gz=unpacked[7],
+            qx=unpacked[8],
+            qy=unpacked[9],
+            qz=unpacked[10],
+            qw=unpacked[11],
+            pitch_rad=unpacked[12],
+            yaw_rad=unpacked[13],
+            roll_rad=unpacked[14],
+        )
+        return VideoPacketHeader(
+            frame_timestamp_ns=unpacked[0],
+            synced_sample=synced_sample,
+            payload_size=unpacked[15],
+        )
+
+    def decode_video_payload(self, payload: bytes, header: VideoPacketHeader) -> None:
         try:
             for packet in self.decoder.parse(payload):
                 for frame in self.decoder.decode(packet):
@@ -314,7 +392,13 @@ class ReceiverApp:
                     image = Image.fromarray(rgb_frame)
                     if not self.logged_first_frame:
                         self.logged_first_frame = True
-                        self.log(f"First video frame decoded {frame.width}x{frame.height}")
+                        delta_ms = (
+                            (header.synced_sample.timestamp_ns - header.frame_timestamp_ns) / 1_000_000.0
+                        )
+                        self.log(
+                            "First video frame decoded "
+                            f"{frame.width}x{frame.height}, sync delta={delta_ms:+.3f} ms"
+                        )
                     self.push_frame(image)
         except av.AVError as error:
             self.log(f"Decoder error: {error}")
@@ -355,23 +439,50 @@ class ReceiverApp:
             self.last_imu_packet_count = self.imu_packets
             self.last_rate_time = now
 
-        video_ts = "-" if self.video_last_ts == 0 else str(self.video_last_ts)
+        synced_sample = self.last_synced_sample
+        frame_ts = "-" if self.video_last_ts == 0 else str(self.video_last_ts)
+        frame_relative = self.format_relative_ns(self.video_last_ts, self.first_video_ts)
+        synced_ts = "-" if self.synced_imu_last_ts == 0 else str(self.synced_imu_last_ts)
+        sync_delta = self.format_delta_ms(self.video_last_ts, self.synced_imu_last_ts)
+        frame_accel = self.format_triplet(
+            synced_sample.ax,
+            synced_sample.ay,
+            synced_sample.az,
+        ) if synced_sample else "-"
+        frame_gyro = self.format_triplet(
+            synced_sample.gx,
+            synced_sample.gy,
+            synced_sample.gz,
+        ) if synced_sample else "-"
+        frame_euler = self.format_euler_deg(synced_sample) if synced_sample else "-"
         self.video_stats_var.set(
             f"Video packets: {self.video_packets}\n"
             f"Video FPS: {self.video_fps:.1f}\n"
-            f"Timestamp: {video_ts}"
+            f"Frame timestamp: {frame_ts}\n"
+            f"Frame T+: {frame_relative}\n"
+            f"Synced IMU timestamp: {synced_ts}\n"
+            f"Sync delta: {sync_delta}\n"
+            f"Frame accel: {frame_accel}\n"
+            f"Frame gyro: {frame_gyro}\n"
+            f"Frame Euler(deg): {frame_euler}"
         )
 
         sample = self.last_imu_sample
         imu_ts = "-" if self.imu_last_ts == 0 else str(self.imu_last_ts)
-        accel = "-" if sample is None else f"{sample.ax:+.3f}, {sample.ay:+.3f}, {sample.az:+.3f}"
-        gyro = "-" if sample is None else f"{sample.gx:+.3f}, {sample.gy:+.3f}, {sample.gz:+.3f}"
+        imu_relative = self.format_relative_ns(self.imu_last_ts, self.first_imu_ts)
+        accel = self.format_triplet(sample.ax, sample.ay, sample.az) if sample else "-"
+        gyro = self.format_triplet(sample.gx, sample.gy, sample.gz) if sample else "-"
+        quat = self.format_quaternion(sample) if sample else "-"
+        euler = self.format_euler_deg(sample) if sample else "-"
         self.imu_stats_var.set(
             f"IMU packets: {self.imu_packets}\n"
             f"IMU Hz: {self.imu_hz:.1f}\n"
             f"Timestamp: {imu_ts}\n"
+            f"IMU T+: {imu_relative}\n"
             f"Accel: {accel}\n"
-            f"Gyro: {gyro}"
+            f"Gyro: {gyro}\n"
+            f"Quat: {quat}\n"
+            f"Euler(deg): {euler}"
         )
 
         if self.video_connected or self.imu_connected:
@@ -419,6 +530,32 @@ class ReceiverApp:
         except OSError:
             pass
         return sorted(addresses) or ["127.0.0.1"]
+
+    def format_triplet(self, x: float, y: float, z: float) -> str:
+        return f"{x:+.3f}, {y:+.3f}, {z:+.3f}"
+
+    def format_quaternion(self, sample: ImuSample) -> str:
+        return (
+            f"x={sample.qx:+.4f}, y={sample.qy:+.4f}, "
+            f"z={sample.qz:+.4f}, w={sample.qw:+.4f}"
+        )
+
+    def format_euler_deg(self, sample: ImuSample) -> str:
+        return (
+            f"P={sample.pitch_rad * RAD_TO_DEG:+.1f}, "
+            f"Y={sample.yaw_rad * RAD_TO_DEG:+.1f}, "
+            f"R={sample.roll_rad * RAD_TO_DEG:+.1f}"
+        )
+
+    def format_relative_ns(self, timestamp_ns: int, base_ns: int | None) -> str:
+        if timestamp_ns <= 0 or base_ns is None or base_ns <= 0:
+            return "-"
+        return f"{(timestamp_ns - base_ns) / 1_000_000_000.0:+.3f} s"
+
+    def format_delta_ms(self, left_ns: int, right_ns: int) -> str:
+        if left_ns <= 0 or right_ns <= 0:
+            return "-"
+        return f"{(right_ns - left_ns) / 1_000_000.0:+.3f} ms"
 
     def on_close(self) -> None:
         self.stop_receiver()

@@ -82,16 +82,32 @@ class NetworkSender(
     }
 
     fun sendVideoPacket(
-        timestampNs: Long,
+        frameTimestampNs: Long,
         payload: ByteArray,
+        syncedSample: ImuSample?,
         countInStats: Boolean
     ) {
         if (!running.get() || payload.isEmpty()) {
             return
         }
-        val packet = ByteBuffer.allocate(HEADER_BYTES + payload.size)
+        val sample = syncedSample ?: EMPTY_SAMPLE
+        val packet = ByteBuffer.allocate(VIDEO_PACKET_HEADER_BYTES + payload.size)
             .order(ByteOrder.BIG_ENDIAN)
-            .putLong(timestampNs)
+            .putLong(frameTimestampNs)
+            .putLong(sample.timestampNs)
+            .putFloat(sample.ax)
+            .putFloat(sample.ay)
+            .putFloat(sample.az)
+            .putFloat(sample.gx)
+            .putFloat(sample.gy)
+            .putFloat(sample.gz)
+            .putFloat(sample.qx)
+            .putFloat(sample.qy)
+            .putFloat(sample.qz)
+            .putFloat(sample.qw)
+            .putFloat(sample.pitchRad)
+            .putFloat(sample.yawRad)
+            .putFloat(sample.rollRad)
             .putInt(payload.size)
             .put(payload)
             .array()
@@ -155,6 +171,13 @@ class NetworkSender(
             .putFloat(sample.gx)
             .putFloat(sample.gy)
             .putFloat(sample.gz)
+            .putFloat(sample.qx)
+            .putFloat(sample.qy)
+            .putFloat(sample.qz)
+            .putFloat(sample.qw)
+            .putFloat(sample.pitchRad)
+            .putFloat(sample.yawRad)
+            .putFloat(sample.rollRad)
             .array()
     }
 
@@ -193,7 +216,23 @@ class NetworkSender(
         const val CONNECT_TIMEOUT_MS = 5_000
         const val IMU_JOIN_TIMEOUT_MS = 500L
         const val IMU_IDLE_SLEEP_MS = 2L
-        const val HEADER_BYTES = 12
-        const val IMU_PACKET_BYTES = 32
+        const val VIDEO_PACKET_HEADER_BYTES = 72
+        const val IMU_PACKET_BYTES = 60
+        val EMPTY_SAMPLE = ImuSample(
+            timestampNs = 0L,
+            ax = 0f,
+            ay = 0f,
+            az = 0f,
+            gx = 0f,
+            gy = 0f,
+            gz = 0f,
+            qx = 0f,
+            qy = 0f,
+            qz = 0f,
+            qw = 1f,
+            pitchRad = 0f,
+            yawRad = 0f,
+            rollRad = 0f
+        )
     }
 }

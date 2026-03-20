@@ -15,6 +15,7 @@ import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.SystemClock
 import android.util.Range
 import android.util.Size
 import android.view.Surface
@@ -26,6 +27,7 @@ class CameraStreamer(
     private val activity: Activity,
     private val textureView: TextureView,
     private val networkSender: NetworkSender,
+    private val imuCollector: ImuCollector,
     private val listener: Listener
 ) {
 
@@ -67,6 +69,9 @@ class CameraStreamer(
     @Volatile
     private var drainRunning = false
 
+    @Volatile
+    private var encoderToElapsedRealtimeOffsetNs = 0L
+
     private var textureListener: TextureView.SurfaceTextureListener? = null
 
     @Throws(Exception::class)
@@ -74,6 +79,7 @@ class CameraStreamer(
         stopping.set(false)
         errorDelivered.set(false)
         startedDelivered.set(false)
+        encoderToElapsedRealtimeOffsetNs = SystemClock.elapsedRealtimeNanos() - System.nanoTime()
         startCameraThread()
         prepareEncoder()
         if (textureView.isAvailable) {
@@ -323,7 +329,12 @@ class CameraStreamer(
                         if (!codecConfigSent) {
                             val configBytes = extractCodecConfig(codec.outputFormat)
                             if (configBytes.isNotEmpty()) {
-                                networkSender.sendVideoPacket(0L, configBytes, countInStats = false)
+                                networkSender.sendVideoPacket(
+                                    frameTimestampNs = 0L,
+                                    payload = configBytes,
+                                    syncedSample = null,
+                                    countInStats = false
+                                )
                                 codecConfigSent = true
                             }
                         }
@@ -335,13 +346,20 @@ class CameraStreamer(
                             val packet = outputBuffer.toByteArray(bufferInfo.offset, bufferInfo.size)
                             val isCodecConfig =
                                 bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0
-                            val timestampNs = bufferInfo.presentationTimeUs * 1_000L
+                            val frameTimestampNs =
+                                bufferInfo.presentationTimeUs * 1_000L + encoderToElapsedRealtimeOffsetNs
+                            val syncedSample = if (isCodecConfig) {
+                                null
+                            } else {
+                                imuCollector.getFrameSyncedSample(frameTimestampNs)
+                            }
                             if (isCodecConfig) {
                                 codecConfigSent = true
                             }
                             networkSender.sendVideoPacket(
-                                timestampNs = timestampNs,
+                                frameTimestampNs = frameTimestampNs,
                                 payload = packet,
+                                syncedSample = syncedSample,
                                 countInStats = !isCodecConfig
                             )
                         }
