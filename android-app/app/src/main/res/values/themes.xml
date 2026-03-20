@@ -1,0 +1,6 @@
+<resources>
+    <style name="Theme.VioStreamer" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/surface</item>
+        <item name="android:colorAccent">@color/accent</item>
+    </style>
+</resources>

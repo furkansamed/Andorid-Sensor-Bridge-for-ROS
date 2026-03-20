@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">VIO Streamer</string>
+    <string name="ip_hint">192.168.1.x</string>
+    <string name="start">Start</string>
+    <string name="stop">Stop</string>
+    <string name="status_template">State: %1$s
+Video: %2$.1f fps
+IMU: %3$.1f Hz</string>
+</resources>

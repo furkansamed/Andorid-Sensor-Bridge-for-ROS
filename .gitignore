@@ -1,0 +1,25 @@
+# Local IDE / build state
+.gradle/
+.idea/
+.kotlin/
+
+# Android
+android-app/local.properties
+android-app/.gradle/
+android-app/.idea/
+android-app/.kotlin/
+android-app/**/build/
+
+# Python
+**/__pycache__/
+*.pyc
+pc-receiver/receiver.log
+
+# ROS 2
+build/
+install/
+log/
+
+# Local debug artifacts
+vio_ui.xml
+vio_ui_streaming.xml

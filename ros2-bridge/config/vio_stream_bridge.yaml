@@ -1,0 +1,22 @@
+vio_stream_bridge:
+  ros__parameters:
+    bind_address: "0.0.0.0"
+    video_port: 5000
+    imu_port: 5001
+    camera_frame_id: "camera_optical_frame"
+    imu_frame_id: "imu_link"
+
+    publish_camera_info: false
+    camera_name: "phone_camera"
+    image_width: 640
+    image_height: 480
+    distortion_model: "plumb_bob"
+
+    distortion_coefficients: [0.0, 0.0, 0.0, 0.0, 0.0]
+    camera_matrix: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+    rectification_matrix: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+    projection_matrix: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    orientation_covariance: [-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    angular_velocity_covariance: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    linear_acceleration_covariance: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
