@@ -7,6 +7,11 @@ vio_stream_bridge:
     imu_frame_id: "imu_link"
 
     publish_camera_info: false
+    diagnostics_enabled: false
+    diagnostics_period_sec: 1.0
+    publish_period_sec: 0.002
+    max_video_messages_per_cycle: 1
+    max_imu_messages_per_cycle: 1
     camera_name: "phone_camera"
     image_width: 640
     image_height: 480

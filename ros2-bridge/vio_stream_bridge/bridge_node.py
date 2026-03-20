@@ -4,6 +4,7 @@ import queue
 import socket
 import struct
 import threading
+import time
 from copy import deepcopy
 from dataclasses import dataclass
 
@@ -56,6 +57,19 @@ class DecodedFrame:
     synced_imu: ImuSample | None
 
 
+@dataclass
+class PublishDiagnosticsWindow:
+    image_published: int = 0
+    camera_info_published: int = 0
+    imu_published: int = 0
+    synced_imu_published: int = 0
+    video_frames_coalesced: int = 0
+    video_queue_drops: int = 0
+    imu_queue_drops: int = 0
+    max_video_batch: int = 0
+    max_imu_batch: int = 0
+
+
 class ClockMapper:
     def __init__(self, now_provider) -> None:
         self._now_provider = now_provider
@@ -85,6 +99,24 @@ class VioStreamBridge(Node):
         self.publish_camera_info = (
             self.get_parameter("publish_camera_info").get_parameter_value().bool_value
         )
+        self.diagnostics_enabled = (
+            self.get_parameter("diagnostics_enabled").get_parameter_value().bool_value
+        )
+        self.diagnostics_period_sec = (
+            self.get_parameter("diagnostics_period_sec").get_parameter_value().double_value
+        )
+        self.publish_period_sec = max(
+            0.001,
+            self.get_parameter("publish_period_sec").get_parameter_value().double_value,
+        )
+        self.max_video_messages_per_cycle = max(
+            1,
+            self.get_parameter("max_video_messages_per_cycle").get_parameter_value().integer_value,
+        )
+        self.max_imu_messages_per_cycle = max(
+            1,
+            self.get_parameter("max_imu_messages_per_cycle").get_parameter_value().integer_value,
+        )
         self.orientation_covariance = self._get_double_list("orientation_covariance")
         self.angular_velocity_covariance = self._get_double_list("angular_velocity_covariance")
         self.linear_acceleration_covariance = self._get_double_list("linear_acceleration_covariance")
@@ -102,6 +134,9 @@ class VioStreamBridge(Node):
         self.video_queue: queue.Queue[DecodedFrame] = queue.Queue(maxsize=4)
         self.imu_queue: queue.Queue[ImuSample] = queue.Queue(maxsize=1024)
         self.stop_event = threading.Event()
+        self._diagnostics_lock = threading.Lock()
+        self._diagnostics_window = PublishDiagnosticsWindow()
+        self._diagnostics_window_started_at = time.monotonic()
         self.clock_mapper = ClockMapper(lambda: self.get_clock().now().nanoseconds)
         self.base_camera_info = self._build_base_camera_info()
         self.video_listener: socket.socket | None = None
@@ -110,12 +145,25 @@ class VioStreamBridge(Node):
         self.imu_thread = threading.Thread(target=self._imu_server_loop, name="ros-imu", daemon=True)
         self.video_thread.start()
         self.imu_thread.start()
-        self.publish_timer = self.create_timer(0.005, self._publish_pending_messages)
+        self.publish_timer = self.create_timer(
+            self.publish_period_sec,
+            self._publish_pending_messages,
+        )
+        self.diagnostics_timer = None
+        if self.diagnostics_enabled:
+            self.diagnostics_timer = self.create_timer(
+                max(self.diagnostics_period_sec, 0.1),
+                self._log_publish_diagnostics,
+            )
 
         self.get_logger().info(
             f"Listening for Android streamer on {self.bind_address}:{self.video_port} (TCP) "
             f"and {self.bind_address}:{self.imu_port} (UDP)"
         )
+        if self.diagnostics_enabled:
+            self.get_logger().info(
+                f"Publish diagnostics enabled with a {max(self.diagnostics_period_sec, 0.1):.2f}s window"
+            )
 
     def _declare_parameters(self) -> None:
         self.declare_parameter("bind_address", "0.0.0.0")
@@ -124,6 +172,11 @@ class VioStreamBridge(Node):
         self.declare_parameter("camera_frame_id", "camera_optical_frame")
         self.declare_parameter("imu_frame_id", "imu_link")
         self.declare_parameter("publish_camera_info", False)
+        self.declare_parameter("diagnostics_enabled", False)
+        self.declare_parameter("diagnostics_period_sec", 1.0)
+        self.declare_parameter("publish_period_sec", 0.002)
+        self.declare_parameter("max_video_messages_per_cycle", 1)
+        self.declare_parameter("max_imu_messages_per_cycle", 1)
         self.declare_parameter("camera_name", "phone_camera")
         self.declare_parameter("image_width", 640)
         self.declare_parameter("image_height", 480)
@@ -233,6 +286,7 @@ class VioStreamBridge(Node):
                                             effective_header.synced_sample
                                         ),
                                     ),
+                                    queue_name="video",
                                 )
             except OSError as error:
                 self.get_logger().warning(f"Video connection dropped: {error}")
@@ -269,22 +323,30 @@ class VioStreamBridge(Node):
                 self.get_logger().info(f"IMU packets arriving from {address[0]}:{address[1]}")
                 logged_first_sender = True
 
-            self._put_latest(self.imu_queue, ImuSample(*IMU_STRUCT.unpack(payload)))
+            self._put_latest(
+                self.imu_queue,
+                ImuSample(*IMU_STRUCT.unpack(payload)),
+                queue_name="imu",
+            )
 
     def _publish_pending_messages(self) -> None:
-        while True:
-            try:
-                sample = self.imu_queue.get_nowait()
-            except queue.Empty:
-                break
+        imu_samples = self._drain_queue_snapshot(
+            self.imu_queue,
+            self.max_imu_messages_per_cycle,
+        )
+        imu_batch_count = len(imu_samples)
+        for sample in imu_samples:
             self._publish_imu(sample, self.imu_publisher)
 
-        while True:
-            try:
-                frame = self.video_queue.get_nowait()
-            except queue.Empty:
-                break
-            self._publish_image(frame)
+        video_frames, video_drained_count = self._drain_latest_from_queue(
+            self.video_queue,
+            self.max_video_messages_per_cycle,
+        )
+        if video_frames:
+            for frame in video_frames:
+                self._publish_image(frame)
+
+        self._record_publish_batches(video_drained_count, imu_batch_count)
 
     def _publish_image(self, frame: DecodedFrame) -> None:
         stamp = self.clock_mapper.to_ros_time(frame.timestamp_ns).to_msg()
@@ -298,6 +360,7 @@ class VioStreamBridge(Node):
         image_message.step = frame.step
         image_message.data = frame.data
         self.image_publisher.publish(image_message)
+        self._record_publish("image")
 
         if self.publish_camera_info:
             camera_info = deepcopy(self.base_camera_info)
@@ -306,15 +369,22 @@ class VioStreamBridge(Node):
             camera_info.width = frame.width
             camera_info.height = frame.height
             self.camera_info_publisher.publish(camera_info)
+            self._record_publish("camera_info")
 
         if frame.synced_imu is not None:
-            self._publish_imu(frame.synced_imu, self.synced_imu_publisher, stamp_override=stamp)
+            self._publish_imu(
+                frame.synced_imu,
+                self.synced_imu_publisher,
+                stamp_override=stamp,
+                diagnostics_key="synced_imu",
+            )
 
     def _publish_imu(
         self,
         sample: ImuSample,
         publisher,
         stamp_override=None,
+        diagnostics_key: str = "imu",
     ) -> None:
         stamp = stamp_override or self.clock_mapper.to_ros_time(sample.timestamp_ns).to_msg()
         imu_message = Imu()
@@ -334,6 +404,7 @@ class VioStreamBridge(Node):
         imu_message.angular_velocity_covariance = self.angular_velocity_covariance
         imu_message.linear_acceleration_covariance = self.linear_acceleration_covariance
         publisher.publish(imu_message)
+        self._record_publish(diagnostics_key)
 
     def _parse_video_header(self, payload: bytes) -> VideoPacketHeader:
         unpacked = VIDEO_HEADER_STRUCT.unpack(payload)
@@ -376,7 +447,7 @@ class VioStreamBridge(Node):
             received.extend(chunk)
         return bytes(received)
 
-    def _put_latest(self, target_queue: queue.Queue, item) -> None:
+    def _put_latest(self, target_queue: queue.Queue, item, queue_name: str) -> None:
         while True:
             try:
                 target_queue.put_nowait(item)
@@ -384,8 +455,112 @@ class VioStreamBridge(Node):
             except queue.Full:
                 try:
                     target_queue.get_nowait()
+                    self._record_queue_drop(queue_name)
                 except queue.Empty:
                     return
+
+    def _drain_queue_snapshot(self, target_queue: queue.Queue, max_items: int) -> list:
+        drained: list = []
+        drain_limit = min(max(target_queue.qsize(), 0), max_items)
+        for _ in range(drain_limit):
+            try:
+                drained.append(target_queue.get_nowait())
+            except queue.Empty:
+                break
+        return drained
+
+    def _drain_latest_from_queue(
+        self,
+        target_queue: queue.Queue,
+        max_publish_items: int,
+    ) -> tuple[list, int]:
+        drained = self._drain_queue_snapshot(
+            target_queue,
+            max(target_queue.qsize(), 0),
+        )
+        drained_count = len(drained)
+        if len(drained) > max_publish_items:
+            self._record_video_coalesced(len(drained) - max_publish_items)
+            drained = drained[-max_publish_items:]
+        return drained, drained_count
+
+    def _record_publish(self, diagnostics_key: str) -> None:
+        if not self.diagnostics_enabled:
+            return
+
+        with self._diagnostics_lock:
+            if diagnostics_key == "image":
+                self._diagnostics_window.image_published += 1
+            elif diagnostics_key == "camera_info":
+                self._diagnostics_window.camera_info_published += 1
+            elif diagnostics_key == "imu":
+                self._diagnostics_window.imu_published += 1
+            elif diagnostics_key == "synced_imu":
+                self._diagnostics_window.synced_imu_published += 1
+
+    def _record_queue_drop(self, queue_name: str) -> None:
+        if not self.diagnostics_enabled:
+            return
+
+        with self._diagnostics_lock:
+            if queue_name == "video":
+                self._diagnostics_window.video_queue_drops += 1
+            elif queue_name == "imu":
+                self._diagnostics_window.imu_queue_drops += 1
+
+    def _record_video_coalesced(self, count: int) -> None:
+        if not self.diagnostics_enabled or count <= 0:
+            return
+
+        with self._diagnostics_lock:
+            self._diagnostics_window.video_frames_coalesced += count
+
+    def _record_publish_batches(self, video_batch_count: int, imu_batch_count: int) -> None:
+        if not self.diagnostics_enabled or (video_batch_count == 0 and imu_batch_count == 0):
+            return
+
+        with self._diagnostics_lock:
+            self._diagnostics_window.max_video_batch = max(
+                self._diagnostics_window.max_video_batch,
+                video_batch_count,
+            )
+            self._diagnostics_window.max_imu_batch = max(
+                self._diagnostics_window.max_imu_batch,
+                imu_batch_count,
+            )
+
+    def _log_publish_diagnostics(self) -> None:
+        now = time.monotonic()
+        with self._diagnostics_lock:
+            window = self._diagnostics_window
+            elapsed = max(now - self._diagnostics_window_started_at, 1e-6)
+            self._diagnostics_window = PublishDiagnosticsWindow()
+            self._diagnostics_window_started_at = now
+
+        self.get_logger().info(
+            "Publish stats %.2fs: image_raw=%.1fHz (%d), camera_info=%.1fHz (%d), "
+            "imu_raw=%.1fHz (%d), imu_image_sync=%.1fHz (%d), coalesced(video=%d), "
+            "drops(video=%d, imu=%d), "
+            "max_batch(video=%d, imu=%d), queue_depth(video=%d, imu=%d)"
+            % (
+                elapsed,
+                window.image_published / elapsed,
+                window.image_published,
+                window.camera_info_published / elapsed,
+                window.camera_info_published,
+                window.imu_published / elapsed,
+                window.imu_published,
+                window.synced_imu_published / elapsed,
+                window.synced_imu_published,
+                window.video_frames_coalesced,
+                window.video_queue_drops,
+                window.imu_queue_drops,
+                window.max_video_batch,
+                window.max_imu_batch,
+                self.video_queue.qsize(),
+                self.imu_queue.qsize(),
+            )
+        )
 
     def shutdown(self) -> None:
         self.stop_event.set()

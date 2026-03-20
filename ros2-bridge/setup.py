@@ -12,7 +12,10 @@ setup(
         ("share/ament_index/resource_index/packages", [f"resource/{package_name}"]),
         (f"share/{package_name}", ["package.xml"]),
         (f"share/{package_name}/launch", ["launch/vio_stream_bridge.launch.py"]),
-        (f"share/{package_name}/config", ["config/vio_stream_bridge.yaml"]),
+        (
+            f"share/{package_name}/config",
+            ["config/vio_stream_bridge.yaml", "config/cyclonedds.xml"],
+        ),
         (f"share/{package_name}", ["README.md"]),
     ],
     install_requires=["setuptools"],

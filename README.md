@@ -46,9 +46,9 @@ powershell -ExecutionPolicy Bypass -File .\run_receiver.ps1
 From the repo root on Ubuntu:
 
 ```bash
-source /opt/ros/$ROS_DISTRO/setup.bash
+sudo apt install ros-$ROS_DISTRO-rmw-cyclonedds-cpp
 python3 -m pip install av numpy
 colcon build --base-paths ros2-bridge --symlink-install
-source install/setup.bash
+source ros2-bridge/scripts/use_cyclonedds.sh
 ros2 launch vio_stream_bridge vio_stream_bridge.launch.py
 ```
